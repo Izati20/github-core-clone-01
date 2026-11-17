@@ -8,7 +8,7 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { deflateSync, inflate, constants as zlibConstants } from 'node:zlib';
+import { deflateSync, inflateSync, constants as zlibConstants } from 'node:zlib';
 
 // --------------------------------------------------------------------------- constants
 
@@ -163,14 +163,33 @@ function parseTagTarget(data: Buffer): string | null {
 
 // ---- packfiles
 
-/** Inflate one deflate stream starting at `offset`; resolves with the payload and bytes consumed. */
-function inflateAt(buffer: Buffer, offset: number): Promise<{ data: Buffer; consumed: number }> {
-  return new Promise((resolve, reject) => {
-    const stream = inflate(buffer.subarray(offset), (err, data) => {
-      if (err) reject(err);
-      else resolve({ data, consumed: stream.bytesRead });
-    });
-  });
+/**
+ * Inflate one deflate stream starting at `offset` and report how many bytes it consumed.
+ * Node's zlib reports no consumed count, but inflateSync ignores trailing bytes and throws on
+ * a truncated stream, so the stream's end is the smallest prefix that inflates successfully:
+ * a binary search over the prefix length finds it exactly.
+ */
+function inflateAt(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
+  let lo = offset; // known to fail (too short)
+  let hi = buffer.length; // the whole rest always succeeds for a well-formed stream
+  const attempt = (end: number): Buffer | null => {
+    try {
+      const out = inflateSync(buffer.subarray(offset, end));
+      return out.length === expectedSize ? out : null;
+    } catch {
+      return null;
+    }
+  };
+  const whole = attempt(hi);
+  if (whole === null) throw new Error('pack object does not inflate');
+  while (hi - lo > 1) {
+    const mid = lo + Math.floor((hi - lo) / 2);
+    if (attempt(mid) !== null) hi = mid;
+    else lo = mid;
+  }
+  const data = attempt(hi);
+  if (data === null) throw new Error('pack object does not inflate');
+  return { data, consumed: hi - offset };
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -236,7 +255,7 @@ interface PackEntry {
  * Parse a whole packfile into resolved objects. `lookup` resolves REF_DELTA bases that live
  * outside the pack (thin packs); OFS_DELTA bases are always in-pack.
  */
-async function parsePack(pack: Buffer, lookup: (oid: string) => GitObject | undefined): Promise<PackEntry[]> {
+function parsePack(pack: Buffer, lookup: (oid: string) => GitObject | undefined): PackEntry[] {
   if (pack.length < 32 || pack.toString('latin1', 0, 4) !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
@@ -284,8 +303,7 @@ async function parsePack(pack: Buffer, lookup: (oid: string) => GitObject | unde
       entry.baseOid = pack.toString('hex', pos, pos + 20);
       pos += 20;
     }
-    const inflated = await inflateAt(pack, pos);
-    if (inflated.data.length !== size) throw new Error('pack object size mismatch');
+    const inflated = inflateAt(pack, pos, size);
     pos += inflated.consumed;
     if (type === 'ofs-delta' || type === 'ref-delta') entry.data = inflated.data; // delta instructions
     else entry.data = inflated.data;
@@ -2115,6 +2133,14 @@ async function runWithHarness(envUrl: string): Promise<void> {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2_000).unref();
 }
+
+// A single bad request must never take the forge down; log and keep serving.
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`uncaught: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+});
+process.on('unhandledRejection', (err) => {
+  process.stderr.write(`unhandled rejection: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+});
 
 const envUrl = process.env.MAKEFUN_ENV_URL;
 if (envUrl !== undefined && envUrl !== '') {
