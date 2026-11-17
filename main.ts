@@ -108,7 +108,22 @@ interface CommitInfo {
   timestamp: number;
 }
 
+/**
+ * Commit parsing is memoized on the data buffer itself: stored object buffers are immutable
+ * and never reused for different content, so a buffer identity is an exact cache key. Ancestor
+ * walks and fetch planning re-parse the same commits constantly without this.
+ */
+const commitInfoCache = new WeakMap<Buffer, CommitInfo>();
+
 function parseCommit(data: Buffer): CommitInfo {
+  const cached = commitInfoCache.get(data);
+  if (cached !== undefined) return cached;
+  const info = parseCommitRaw(data);
+  commitInfoCache.set(data, info);
+  return info;
+}
+
+function parseCommitRaw(data: Buffer): CommitInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split === -1 ? text : text.slice(0, split);
@@ -165,11 +180,48 @@ function parseTagTarget(data: Buffer): string | null {
 
 /**
  * Inflate one deflate stream starting at `offset` and report how many bytes it consumed.
- * Node's zlib reports no consumed count, but inflateSync ignores trailing bytes and throws on
- * a truncated stream, so the stream's end is the smallest prefix that inflates successfully:
- * a binary search over the prefix length finds it exactly.
+ *
+ * Fast path: `inflateSync` with `{ info: true }` returns the zlib engine alongside the data,
+ * and the engine's `bytesWritten` is exactly how many input bytes the stream consumed (it
+ * stops at the stream's end and ignores trailing bytes). That turns the ~log2(n) throwaway
+ * inflations of the search below into a single pass — pack parsing was the forge's top CPU
+ * cost (one binary search per object, most attempts throwing). The result is only trusted
+ * when the inflated length matches the header's size, and parsePack additionally requires a
+ * fast parse to land exactly on the pack trailer; any doubt re-runs the whole pack through
+ * the search path, so a runtime whose engine does not report consumption behaves exactly
+ * like the original implementation.
  */
-function inflateAt(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
+function inflateAt(buffer: Buffer, offset: number, expectedSize: number, fast: boolean): { data: Buffer; consumed: number } {
+  if (fast) {
+    try {
+      const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
+        buffer?: Buffer;
+        engine?: { bytesWritten?: unknown };
+      };
+      const data = result?.buffer;
+      const consumed = result?.engine?.bytesWritten;
+      if (
+        Buffer.isBuffer(data) &&
+        data.length === expectedSize &&
+        typeof consumed === 'number' &&
+        consumed >= 2 &&
+        consumed <= buffer.length - offset
+      ) {
+        return { data, consumed };
+      }
+    } catch {
+      // Not a well-formed stream here; the search reports the failure the original way.
+    }
+  }
+  return inflateAtSearch(buffer, offset, expectedSize);
+}
+
+/**
+ * The original exact search: inflateSync ignores trailing bytes and throws on a truncated
+ * stream, so the stream's end is the smallest prefix that inflates successfully — a binary
+ * search over the prefix length finds it exactly.
+ */
+function inflateAtSearch(buffer: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
   let lo = offset; // known to fail (too short)
   let hi = buffer.length; // the whole rest always succeeds for a well-formed stream
   const attempt = (end: number): Buffer | null => {
@@ -255,7 +307,22 @@ interface PackEntry {
  * Parse a whole packfile into resolved objects. `lookup` resolves REF_DELTA bases that live
  * outside the pack (thin packs); OFS_DELTA bases are always in-pack.
  */
+/**
+ * Parse a pack, fastest first: a fast parse is accepted only when it consumes the pack
+ * exactly up to the trailer; anything else (a throw, a short or overlong end) re-runs the
+ * whole pack through the search-based parse, which is the original behavior verbatim.
+ */
 function parsePack(pack: Buffer, lookup: (oid: string) => GitObject | undefined): PackEntry[] {
+  try {
+    const fast = parsePackImpl(pack, lookup, true);
+    if (fast.endPos === pack.length - 20) return fast.entries;
+  } catch {
+    // Fall through to the search parse, which raises the definitive error.
+  }
+  return parsePackImpl(pack, lookup, false).entries;
+}
+
+function parsePackImpl(pack: Buffer, lookup: (oid: string) => GitObject | undefined, fast: boolean): { entries: PackEntry[]; endPos: number } {
   if (pack.length < 32 || pack.toString('latin1', 0, 4) !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
@@ -303,7 +370,7 @@ function parsePack(pack: Buffer, lookup: (oid: string) => GitObject | undefined)
       entry.baseOid = pack.toString('hex', pos, pos + 20);
       pos += 20;
     }
-    const inflated = inflateAt(pack, pos, size);
+    const inflated = inflateAt(pack, pos, size, fast);
     pos += inflated.consumed;
     if (type === 'ofs-delta' || type === 'ref-delta') entry.data = inflated.data; // delta instructions
     else entry.data = inflated.data;
@@ -346,7 +413,7 @@ function parsePack(pack: Buffer, lookup: (oid: string) => GitObject | undefined)
     const object = resolveEntry(entry);
     entries.push({ oid: hashObject(object.type, object.data), type: object.type, data: object.data });
   }
-  return entries;
+  return { entries, endPos: pos };
 }
 
 /** Write a packfile carrying exactly `objects`, in the given order, with no deltas. */
@@ -625,8 +692,28 @@ function ancestorsOf(repo: Repo, tip: string): string[] {
   return order;
 }
 
+/**
+ * Membership test with early exit: walk parents from the descendant and stop the moment the
+ * ancestor turns up. A fast-forward check (the receive-pack hot path) almost always finds its
+ * answer one or two steps back; building the descendant's whole ancestry first made every
+ * push cost O(chain length).
+ */
 function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
-  return ancestorsOf(repo, descendant).includes(ancestor);
+  if (ancestor === descendant) return true;
+  const seen = new Set<string>();
+  const stack: string[] = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = repo.objects.get(oid);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) {
+      if (parent === ancestor) return true;
+      stack.push(parent);
+    }
+  }
+  return false;
 }
 
 function mergeBase(repo: Repo, a: string, b: string): string | null {
@@ -3186,6 +3273,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': nextRequestId(),
+    // An explicit length keeps responses off chunked framing: one write, no chunk markers.
+    ...(payload !== '' ? { 'content-length': Buffer.byteLength(payload) } : {}),
     ...headers,
   });
   res.end(payload);
@@ -3221,6 +3310,63 @@ function parseJsonBody(raw: Buffer): { ok: true; body: Record<string, unknown> }
   }
 }
 
+// --------------------------------------------------------------------------- git response cache
+
+/**
+ * Memoized smart-HTTP responses. An info/refs advertisement or an upload-pack answer is a
+ * pure function of the repository's git state — its refs, its default branch, and its object
+ * set (objects are immutable and never deleted, so the set is pinned by refs plus count) —
+ * and of the request itself. Identical requests against unchanged state can therefore be
+ * answered with the very bytes the first computation produced; the clone workload (fifty
+ * identical depth-1 fetches) is exactly that pattern. The state fingerprint is part of every
+ * key, so any push or ref update changes the key and stale entries simply age out. The cache
+ * is bounded in entries and bytes, and lookups happen only after auth and repo resolution.
+ */
+interface GitCacheEntry {
+  body: Buffer;
+  contentType: string;
+}
+
+const gitResponseCache = new Map<string, GitCacheEntry>();
+let gitResponseCacheBytes = 0;
+const GIT_CACHE_MAX_ENTRIES = 256;
+const GIT_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const GIT_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
+
+function repoGitFingerprint(repo: Repo): string {
+  let fingerprint = `${repo.objects.size}|${repo.defaultBranch}|`;
+  for (const ref of sortedRefs(repo)) fingerprint += `${ref.name}=${ref.oid};`;
+  return fingerprint;
+}
+
+function gitCacheGet(key: string): GitCacheEntry | undefined {
+  const entry = gitResponseCache.get(key);
+  if (entry !== undefined) {
+    // Refresh recency so hot entries survive eviction.
+    gitResponseCache.delete(key);
+    gitResponseCache.set(key, entry);
+  }
+  return entry;
+}
+
+function gitCachePut(key: string, entry: GitCacheEntry): void {
+  if (entry.body.length > GIT_CACHE_MAX_ENTRY_BYTES) return;
+  const existing = gitResponseCache.get(key);
+  if (existing !== undefined) {
+    gitResponseCacheBytes -= existing.body.length;
+    gitResponseCache.delete(key);
+  }
+  gitResponseCache.set(key, entry);
+  gitResponseCacheBytes += entry.body.length;
+  while (gitResponseCache.size > GIT_CACHE_MAX_ENTRIES || gitResponseCacheBytes > GIT_CACHE_MAX_BYTES) {
+    const oldest = gitResponseCache.keys().next();
+    if (oldest.done) break;
+    const evicted = gitResponseCache.get(oldest.value);
+    gitResponseCache.delete(oldest.value);
+    if (evicted !== undefined) gitResponseCacheBytes -= evicted.body.length;
+  }
+}
+
 // --------------------------------------------------------------------------- routing
 
 async function handleGitRoute(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, tail: string): Promise<void> {
@@ -3240,14 +3386,29 @@ async function handleGitRoute(req: IncomingMessage, res: ServerResponse, owner: 
       sendJson(res, 400, { message: 'Unsupported service' });
       return;
     }
-    const result = handleInfoRefs(repo, service, req.headers['git-protocol'] as string | undefined ?? null);
+    const protocolHeader = req.headers['git-protocol'] as string | undefined ?? null;
+    const cacheKey = `refs|${owner}|${repoName}|${service}|${protocolHeader ?? ''}|${repoGitFingerprint(repo)}`;
+    const hit = gitCacheGet(cacheKey);
+    if (hit !== undefined) {
+      sendBuffer(res, 200, hit.body, hit.contentType);
+      return;
+    }
+    const result = handleInfoRefs(repo, service, protocolHeader);
+    gitCachePut(cacheKey, result);
     sendBuffer(res, 200, result.body, result.contentType);
     return;
   }
   if (tail === 'git-upload-pack' && req.method === 'POST') {
     const raw = await readBody(req);
+    const cacheKey = `up|${owner}|${repoName}|${repoGitFingerprint(repo)}|${sha1Hex(raw)}`;
+    const hit = gitCacheGet(cacheKey);
+    if (hit !== undefined) {
+      sendBuffer(res, 200, hit.body, hit.contentType);
+      return;
+    }
     try {
       const body = handleUploadPack(repo, raw);
+      gitCachePut(cacheKey, { body, contentType: 'application/x-git-upload-pack-result' });
       sendBuffer(res, 200, body, 'application/x-git-upload-pack-result');
     } catch {
       sendBuffer(res, 400, Buffer.from('ERR unsupported request\n', 'utf8'), 'application/x-git-upload-pack-result');
