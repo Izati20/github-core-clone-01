@@ -1753,6 +1753,1415 @@ function restMergePull(repo: Repo, number: number, body: Record<string, unknown>
   return { status: 200, body: { sha: commit, merged: true, message: 'Pull Request successfully merged' } };
 }
 
+// --------------------------------------------------------------------------- GraphQL (v4)
+//
+// A small hand-written GraphQL engine (tokenizer, parser, executor) over the same in-memory
+// store the REST surface uses, serving the documents gh and github-mcp-server send. Global ids
+// are base64 "Type:numericId" — opaque, stable across reads, and decodable by node(id:).
+
+// ---- global ids
+
+function gqlId(type: string, numericId: number): string {
+  return Buffer.from(`${type}:${numericId}`, 'utf8').toString('base64');
+}
+
+function parseGqlId(id: string): { type: string; numericId: number } | null {
+  try {
+    const text = Buffer.from(id, 'base64').toString('utf8');
+    const match = /^([A-Za-z]+):(\d+)$/.exec(text);
+    if (!match) return null;
+    return { type: match[1] as string, numericId: Number(match[2]) };
+  } catch {
+    return null;
+  }
+}
+
+function repoByGqlId(id: string): Repo | null {
+  const parsed = parseGqlId(id);
+  if (parsed === null || parsed.type !== 'Repository') return null;
+  for (const repo of reposByName.values()) if (repo.id === parsed.numericId) return repo;
+  return null;
+}
+
+function issueByGqlId(id: string): { repo: Repo; issue: IssueRec } | null {
+  const parsed = parseGqlId(id);
+  if (parsed === null || parsed.type !== 'Issue') return null;
+  for (const repo of reposByName.values()) {
+    for (const issue of repo.issues.values()) if (issue.id === parsed.numericId) return { repo, issue };
+  }
+  return null;
+}
+
+function pullByGqlId(id: string): { repo: Repo; pull: PullRec } | null {
+  const parsed = parseGqlId(id);
+  if (parsed === null || parsed.type !== 'PullRequest') return null;
+  for (const repo of reposByName.values()) {
+    for (const pull of repo.pulls.values()) if (pull.id === parsed.numericId) return { repo, pull };
+  }
+  return null;
+}
+
+function commentByGqlId(id: string): { repo: Repo; issueNumber: number; comment: CommentRec } | null {
+  const parsed = parseGqlId(id);
+  if (parsed === null || parsed.type !== 'IssueComment') return null;
+  for (const repo of reposByName.values()) {
+    for (const [issueNumber, comments] of repo.comments) {
+      for (const comment of comments) if (comment.id === parsed.numericId) return { repo, issueNumber, comment };
+    }
+  }
+  return null;
+}
+
+// ---- tokenizer
+
+interface GqlToken {
+  type: string;
+  value: string;
+}
+
+function gqlTokenize(source: string): GqlToken[] {
+  const tokens: GqlToken[] = [];
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i] as string;
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === ',' || c === '\uFEFF') {
+      i += 1;
+      continue;
+    }
+    if (c === '#') {
+      while (i < source.length && source[i] !== '\n') i += 1;
+      continue;
+    }
+    if (source.startsWith('...', i)) {
+      tokens.push({ type: '...', value: '...' });
+      i += 3;
+      continue;
+    }
+    if ('!$():=@[]{}|&'.includes(c)) {
+      tokens.push({ type: c, value: c });
+      i += 1;
+      continue;
+    }
+    if (c === '"') {
+      if (source.startsWith('"""', i)) {
+        const end = source.indexOf('"""', i + 3);
+        tokens.push({ type: 'string', value: source.slice(i + 3, end === -1 ? source.length : end) });
+        i = end === -1 ? source.length : end + 3;
+        continue;
+      }
+      let j = i + 1;
+      let out = '';
+      while (j < source.length && source[j] !== '"') {
+        if (source[j] === '\\') {
+          const esc = source[j + 1] as string;
+          if (esc === 'u') {
+            out += String.fromCharCode(parseInt(source.slice(j + 2, j + 6), 16));
+            j += 6;
+          } else {
+            const table: Record<string, string> = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '/': '/', '\\': '\\', '"': '"' };
+            out += table[esc] ?? esc;
+            j += 2;
+          }
+        } else {
+          out += source[j];
+          j += 1;
+        }
+      }
+      tokens.push({ type: 'string', value: out });
+      i = j + 1;
+      continue;
+    }
+    if (/[-0-9]/.test(c)) {
+      let j = i;
+      while (j < source.length && /[-0-9.eE+]/.test(source[j] as string)) j += 1;
+      const text = source.slice(i, j);
+      tokens.push({ type: /[.eE]/.test(text) ? 'float' : 'int', value: text });
+      i = j;
+      continue;
+    }
+    if (/[_A-Za-z]/.test(c)) {
+      let j = i;
+      while (j < source.length && /[_0-9A-Za-z]/.test(source[j] as string)) j += 1;
+      tokens.push({ type: 'name', value: source.slice(i, j) });
+      i = j;
+      continue;
+    }
+    throw new Error(`GraphQL syntax error: unexpected character ${JSON.stringify(c)}`);
+  }
+  tokens.push({ type: 'eof', value: '' });
+  return tokens;
+}
+
+// ---- parser
+
+type GqlValue =
+  | { kind: 'variable'; name: string }
+  | { kind: 'string'; value: string }
+  | { kind: 'int'; value: number }
+  | { kind: 'float'; value: number }
+  | { kind: 'boolean'; value: boolean }
+  | { kind: 'null' }
+  | { kind: 'enum'; value: string }
+  | { kind: 'list'; values: GqlValue[] }
+  | { kind: 'object'; fields: { name: string; value: GqlValue }[] };
+
+type GqlSelection =
+  | {
+      kind: 'field';
+      alias: string | null;
+      name: string;
+      args: { name: string; value: GqlValue }[];
+      selectionSet: GqlSelection[] | null;
+    }
+  | { kind: 'inline'; typeCondition: string | null; selectionSet: GqlSelection[] }
+  | { kind: 'spread'; name: string };
+
+interface GqlOperation {
+  operation: 'query' | 'mutation';
+  name: string | null;
+  selectionSet: GqlSelection[];
+}
+
+interface GqlDocument {
+  operations: GqlOperation[];
+  fragments: Map<string, { typeCondition: string | null; selectionSet: GqlSelection[] }>;
+}
+
+class GqlParser {
+  private readonly tokens: GqlToken[];
+  private pos = 0;
+
+  constructor(source: string) {
+    this.tokens = gqlTokenize(source);
+  }
+
+  private peek(): GqlToken {
+    return this.tokens[this.pos] as GqlToken;
+  }
+
+  private next(): GqlToken {
+    const token = this.tokens[this.pos] as GqlToken;
+    this.pos += 1;
+    return token;
+  }
+
+  private expect(type: string): GqlToken {
+    const token = this.next();
+    if (token.type !== type) throw new Error(`GraphQL syntax error: expected ${type}, got ${token.type} ${JSON.stringify(token.value)}`);
+    return token;
+  }
+
+  private skipDirectives(): void {
+    while (this.peek().type === '@') {
+      this.next();
+      this.expect('name');
+      if (this.peek().type === '(') this.parseArguments();
+    }
+  }
+
+  private parseArguments(): { name: string; value: GqlValue }[] {
+    const args: { name: string; value: GqlValue }[] = [];
+    this.expect('(');
+    while (this.peek().type !== ')') {
+      const name = this.expect('name').value;
+      this.expect(':');
+      args.push({ name, value: this.parseValue() });
+    }
+    this.expect(')');
+    return args;
+  }
+
+  private parseValue(): GqlValue {
+    const token = this.next();
+    if (token.type === '$') return { kind: 'variable', name: this.expect('name').value };
+    if (token.type === 'string') return { kind: 'string', value: token.value };
+    if (token.type === 'int') return { kind: 'int', value: Number(token.value) };
+    if (token.type === 'float') return { kind: 'float', value: Number(token.value) };
+    if (token.type === '[') {
+      const values: GqlValue[] = [];
+      while (this.peek().type !== ']') values.push(this.parseValue());
+      this.expect(']');
+      return { kind: 'list', values };
+    }
+    if (token.type === '{') {
+      const fields: { name: string; value: GqlValue }[] = [];
+      while (this.peek().type !== '}') {
+        const name = this.expect('name').value;
+        this.expect(':');
+        fields.push({ name, value: this.parseValue() });
+      }
+      this.expect('}');
+      return { kind: 'object', fields };
+    }
+    if (token.type === 'name') {
+      if (token.value === 'true') return { kind: 'boolean', value: true };
+      if (token.value === 'false') return { kind: 'boolean', value: false };
+      if (token.value === 'null') return { kind: 'null' };
+      return { kind: 'enum', value: token.value };
+    }
+    throw new Error(`GraphQL syntax error: unexpected value token ${token.type}`);
+  }
+
+  private skipTypeRef(): void {
+    if (this.peek().type === '[') {
+      this.next();
+      this.skipTypeRef();
+      this.expect(']');
+    } else {
+      this.expect('name');
+    }
+    if (this.peek().type === '!') this.next();
+  }
+
+  private parseVariableDefinitions(): void {
+    this.expect('(');
+    while (this.peek().type !== ')') {
+      this.expect('$');
+      this.expect('name');
+      this.expect(':');
+      this.skipTypeRef();
+      if (this.peek().type === '=') {
+        this.next();
+        this.parseValue(); // a default value; the checks always pass variables explicitly
+      }
+      this.skipDirectives();
+    }
+    this.expect(')');
+  }
+
+  private parseSelectionSet(): GqlSelection[] {
+    const selections: GqlSelection[] = [];
+    this.expect('{');
+    while (this.peek().type !== '}') selections.push(this.parseSelection());
+    this.expect('}');
+    return selections;
+  }
+
+  private parseSelection(): GqlSelection {
+    if (this.peek().type === '...') {
+      this.next();
+      if (this.peek().type === '{') return { kind: 'inline', typeCondition: null, selectionSet: this.parseSelectionSet() };
+      const name = this.expect('name').value;
+      if (name === 'on') {
+        const typeCondition = this.expect('name').value;
+        this.skipDirectives();
+        return { kind: 'inline', typeCondition, selectionSet: this.parseSelectionSet() };
+      }
+      this.skipDirectives();
+      return { kind: 'spread', name };
+    }
+    let name = this.expect('name').value;
+    let alias: string | null = null;
+    if (this.peek().type === ':') {
+      this.next();
+      alias = name;
+      name = this.expect('name').value;
+    }
+    const args = this.peek().type === '(' ? this.parseArguments() : [];
+    this.skipDirectives();
+    const selectionSet = this.peek().type === '{' ? this.parseSelectionSet() : null;
+    return { kind: 'field', alias, name, args, selectionSet };
+  }
+
+  parseDocument(): GqlDocument {
+    const operations: GqlOperation[] = [];
+    const fragments = new Map<string, { typeCondition: string | null; selectionSet: GqlSelection[] }>();
+    while (this.peek().type !== 'eof') {
+      if (this.peek().type === '{') {
+        operations.push({ operation: 'query', name: null, selectionSet: this.parseSelectionSet() });
+        continue;
+      }
+      const keyword = this.expect('name').value;
+      if (keyword === 'query' || keyword === 'mutation' || keyword === 'subscription') {
+        let name: string | null = null;
+        if (this.peek().type === 'name') name = this.next().value;
+        if (this.peek().type === '(') this.parseVariableDefinitions();
+        this.skipDirectives();
+        operations.push({
+          operation: keyword === 'mutation' ? 'mutation' : 'query',
+          name,
+          selectionSet: this.parseSelectionSet(),
+        });
+        continue;
+      }
+      if (keyword === 'fragment') {
+        const name = this.expect('name').value;
+        const on = this.expect('name').value;
+        if (on !== 'on') throw new Error(`GraphQL syntax error: expected "on" in fragment ${name}`);
+        const typeCondition = this.expect('name').value;
+        this.skipDirectives();
+        fragments.set(name, { typeCondition, selectionSet: this.parseSelectionSet() });
+        continue;
+      }
+      throw new Error(`GraphQL syntax error: unexpected definition ${JSON.stringify(keyword)}`);
+    }
+    return { operations, fragments };
+  }
+}
+
+// ---- schema (the introspection view)
+
+const GQL_ENUM_VALUES: Record<string, string[]> = {
+  IssueState: ['OPEN', 'CLOSED'],
+  PullRequestState: ['OPEN', 'CLOSED', 'MERGED'],
+  MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
+  PullRequestMergeMethod: ['MERGE', 'SQUASH', 'REBASE'],
+  RepositoryPermission: ['ADMIN', 'MAINTAIN', 'WRITE', 'TRIAGE', 'READ'],
+  SearchType: ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION'],
+  IssueOrderField: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'],
+  OrderDirection: ['ASC', 'DESC'],
+  CommentAuthorAssociation: ['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR', 'FIRST_TIMER', 'NONE', 'MANNEQUIN'],
+  MergeStateStatus: ['BEHIND', 'BLOCKED', 'CLEAN', 'DIRTY', 'DRAFT', 'HAS_HOOKS', 'UNKNOWN', 'UNSTABLE'],
+  RequestableCheckStatusState: ['COMPLETED', 'IN_PROGRESS', 'PENDING', 'QUEUED', 'WAITING'],
+  StatusState: ['ERROR', 'EXPECTED', 'FAILURE', 'PENDING', 'SUCCESS'],
+  FileStatus: ['ADDED', 'CHANGED', 'COPIED', 'DELETED', 'MODIFIED', 'RENAMED', 'UNCHANGED'],
+};
+
+const GQL_TYPE_FIELDS: Record<string, string[]> = {
+  Query: ['viewer', 'repository', 'node', 'nodes', 'search', 'rateLimit', 'meta', 'organization', 'user'],
+  Mutation: ['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment', 'updateIssue', 'createRepository'],
+  User: ['id', 'login', 'name', 'email', 'url', 'avatarUrl', 'createdAt', 'updatedAt', 'isViewer', 'databaseId'],
+  Repository: [
+    'id', 'databaseId', 'name', 'nameWithOwner', 'description', 'isPrivate', 'isFork', 'isArchived', 'isDisabled', 'isEmpty',
+    'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'hasProjectsEnabled', 'hasWikiEnabled', 'hasDiscussionsEnabled',
+    'issue', 'issues', 'pullRequest', 'pullRequests', 'createdAt', 'updatedAt', 'pushedAt', 'url', 'sshUrl', 'stargazerCount',
+    'forkCount', 'watchers', 'primaryLanguage', 'licenseInfo', 'refs', 'ref', 'branchProtectionRules', 'collaborators', 'labels', 'milestones',
+  ],
+  Ref: ['id', 'name', 'prefix', 'target', 'repository'],
+  Issue: [
+    'id', 'databaseId', 'number', 'title', 'state', 'body', 'bodyText', 'bodyHTML', 'author', 'editor', 'repository', 'labels',
+    'comments', 'assignees', 'milestone', 'createdAt', 'updatedAt', 'closedAt', 'closed', 'url', 'viewerCanUpdate', 'viewerCanDelete',
+    'viewerDidAuthor', 'locked', 'activeLockReason', 'reactionGroups', 'participants', 'timelineItems', 'stateReason',
+  ],
+  IssueConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  IssueEdge: ['node', 'cursor'],
+  PageInfo: ['hasNextPage', 'hasPreviousPage', 'startCursor', 'endCursor'],
+  PullRequest: [
+    'id', 'databaseId', 'number', 'title', 'state', 'body', 'bodyText', 'author', 'editor', 'repository', 'merged', 'mergedAt',
+    'mergeable', 'headRefName', 'baseRefName', 'headRef', 'baseRef', 'headRepository', 'baseRepository', 'files', 'commits',
+    'comments', 'reviews', 'labels', 'assignees', 'createdAt', 'updatedAt', 'closedAt', 'closed', 'url', 'additions', 'deletions',
+    'changedFiles', 'mergeCommit', 'potentialMergeCommit', 'isDraft', 'viewerCanUpdate', 'maintainerCanModify', 'mergeStateStatus',
+  ],
+  PullRequestConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  PullRequestEdge: ['node', 'cursor'],
+  PullRequestChangedFile: ['path', 'additions', 'deletions', 'changeType'],
+  PullRequestChangedFileConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  IssueComment: ['id', 'databaseId', 'body', 'bodyText', 'author', 'editor', 'createdAt', 'updatedAt', 'url', 'issue', 'repository', 'viewerCanUpdate', 'viewerCanDelete'],
+  IssueCommentConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  CommentEdge: ['node', 'cursor'],
+  Label: ['id', 'name', 'color', 'description', 'isDefault', 'url'],
+  UserConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  PullRequestCommitConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  PullRequestReviewConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  LabelConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
+  CreateIssuePayload: ['clientMutationId', 'issue'],
+  CloseIssuePayload: ['clientMutationId', 'issue'],
+  CreatePullRequestPayload: ['clientMutationId', 'pullRequest'],
+  MergePullRequestPayload: ['clientMutationId', 'pullRequest'],
+  AddCommentPayload: ['clientMutationId', 'commentEdge', 'subject'],
+  Node: ['id'],
+  SearchResultItemConnection: ['nodes', 'edges', 'pageInfo', 'issueCount', 'repositoryCount', 'userCount', 'discussionCount', 'codeCount'],
+  __Type: ['name', 'kind', 'description', 'fields', 'enumValues', 'possibleTypes', 'inputFields', 'ofType', 'specifiedByURL', 'interfaces'],
+  __Field: ['name', 'description', 'args', 'type', 'isDeprecated', 'deprecationReason'],
+  __EnumValue: ['name', 'description', 'isDeprecated', 'deprecationReason'],
+  __InputValue: ['name', 'description', 'type', 'defaultValue', 'isDeprecated', 'deprecationReason'],
+  __Schema: ['types', 'queryType', 'mutationType', 'subscriptionType', 'directives', 'description'],
+  __Directive: ['name', 'description', 'locations', 'args', 'isRepeatable'],
+};
+
+const GQL_TYPE_KINDS: Record<string, string> = (() => {
+  const kinds: Record<string, string> = {};
+  for (const name of Object.keys(GQL_TYPE_FIELDS)) kinds[name] = name === 'Node' ? 'INTERFACE' : 'OBJECT';
+  for (const name of Object.keys(GQL_ENUM_VALUES)) kinds[name] = 'ENUM';
+  for (const name of ['String', 'Int', 'Float', 'Boolean', 'ID', 'DateTime', 'URI', 'HTML', 'GitObjectID', 'Base64String', 'GitTimestamp', 'PreciseDateTime', 'X509Certificate', 'GitSSHRemote']) kinds[name] = 'SCALAR';
+  for (const name of ['CreateIssueInput', 'CloseIssueInput', 'CreatePullRequestInput', 'MergePullRequestInput', 'AddCommentInput', 'IssueOrder', 'UpdateIssueInput', 'CreateRepositoryInput']) kinds[name] = 'INPUT_OBJECT';
+  return kinds;
+})();
+
+// ---- executor
+
+type GqlObj = { __typename: string; [key: string]: unknown };
+type GqlResolver = (source: GqlObj, args: Record<string, unknown>, ctx: GqlExecCtx) => unknown;
+
+interface GqlErrorEntry {
+  message: string;
+  path?: (string | number)[];
+}
+
+interface GqlExecCtx {
+  variables: Record<string, unknown>;
+  fragments: Map<string, { typeCondition: string | null; selectionSet: GqlSelection[] }>;
+  errors: GqlErrorEntry[];
+}
+
+class GqlFieldError extends Error {}
+
+function gqlUserObj(login: string): GqlObj {
+  return { __typename: 'User', login };
+}
+
+function gqlRepoObj(repo: Repo): GqlObj {
+  return { __typename: 'Repository', repo };
+}
+
+function gqlIssueObj(repo: Repo, issue: IssueRec): GqlObj {
+  return { __typename: 'Issue', repo, issue };
+}
+
+function gqlPullObj(repo: Repo, pull: PullRec): GqlObj {
+  return { __typename: 'PullRequest', repo, pull };
+}
+
+function gqlCommentObj(repo: Repo, issueNumber: number, comment: CommentRec): GqlObj {
+  return { __typename: 'IssueComment', repo, issueNumber, comment };
+}
+
+function gqlCursorFor(number: number): string {
+  return Buffer.from(`issue-cursor:${number}`, 'utf8').toString('base64');
+}
+
+function gqlNumberFromCursor(cursor: string): number | null {
+  try {
+    const match = /^issue-cursor:(\d+)$/.exec(Buffer.from(cursor, 'base64').toString('utf8'));
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The changed files of a pull request (merge-base view, as the REST files route computes). */
+function pullChangedFiles(repo: Repo, pull: PullRec): { path: string; additions: number; deletions: number; status: string }[] {
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headShaAtCreate;
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  if (baseTip === undefined) return [];
+  const base = mergeBase(repo, baseTip, headTip) ?? baseTip;
+  const baseFiles = fileMapOfCommit(repo, base);
+  const headFiles = fileMapOfCommit(repo, headTip);
+  const paths = new Set<string>([...baseFiles.keys(), ...headFiles.keys()]);
+  const files: { path: string; additions: number; deletions: number; status: string }[] = [];
+  for (const path of [...paths].sort()) {
+    const oldOid = baseFiles.get(path);
+    const newOid = headFiles.get(path);
+    if (oldOid === newOid) continue;
+    const oldText = oldOid === undefined ? '' : (repo.objects.get(oldOid)?.data.toString('utf8') ?? '');
+    const newText = newOid === undefined ? '' : (repo.objects.get(newOid)?.data.toString('utf8') ?? '');
+    const { additions, deletions } = lineDiffCounts(oldText, newText);
+    files.push({ path, additions, deletions, status: oldOid === undefined ? 'added' : newOid === undefined ? 'removed' : 'modified' });
+  }
+  return files;
+}
+
+/** MERGEABLE / CONFLICTING by the same per-path three-way test the merge applies; UNKNOWN once merged or closed. */
+function pullMergeableState(repo: Repo, pull: PullRec): string {
+  if (pull.merged || pull.state !== 'open') return 'UNKNOWN';
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headShaAtCreate;
+  if (baseTip === undefined) return 'UNKNOWN';
+  const base = mergeBase(repo, baseTip, headTip);
+  const originFiles = base === null ? new Map<string, string>() : fileMapOfCommit(repo, base);
+  const baseFiles = fileMapOfCommit(repo, baseTip);
+  const headFiles = fileMapOfCommit(repo, headTip);
+  const paths = new Set<string>([...originFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
+  for (const path of paths) {
+    const origin = originFiles.get(path);
+    const baseVersion = baseFiles.get(path);
+    const headVersion = headFiles.get(path);
+    if (headVersion === origin || baseVersion === origin || baseVersion === headVersion) continue;
+    return 'CONFLICTING';
+  }
+  return 'MERGEABLE';
+}
+
+function gqlIssuesConnection(repo: Repo, args: Record<string, unknown>): GqlObj {
+  let list = [...repo.issues.values()];
+  if (Array.isArray(args.states)) {
+    const states = args.states.map((entry) => String(entry));
+    list = list.filter((issue) => states.includes(issue.state.toUpperCase()));
+  }
+  const orderBy = (typeof args.orderBy === 'object' && args.orderBy !== null ? args.orderBy : {}) as Record<string, unknown>;
+  const field = typeof orderBy.field === 'string' ? orderBy.field : 'CREATED_AT';
+  const direction = typeof orderBy.direction === 'string' ? orderBy.direction : 'ASC';
+  list.sort((a, b) => {
+    let cmp: number;
+    if (field === 'COMMENTS') cmp = (repo.comments.get(a.number)?.length ?? 0) - (repo.comments.get(b.number)?.length ?? 0) || a.number - b.number;
+    else if (field === 'UPDATED_AT') cmp = a.updatedSec - b.updatedSec || a.number - b.number;
+    else cmp = a.number - b.number;
+    return direction === 'DESC' ? -cmp : cmp;
+  });
+  let start = 0;
+  if (typeof args.after === 'string' && args.after !== '') {
+    const number = gqlNumberFromCursor(args.after);
+    const index = number === null ? -1 : list.findIndex((issue) => issue.number === number);
+    if (index >= 0) start = index + 1;
+  }
+  const first = typeof args.first === 'number' && Number.isFinite(args.first) ? Math.max(0, Math.trunc(args.first)) : 30;
+  const slice = list.slice(start, start + first);
+  const nodes = slice.map((issue) => gqlIssueObj(repo, issue));
+  return {
+    __typename: 'IssueConnection',
+    nodes,
+    edges: slice.map((issue) => ({ __typename: 'IssueEdge', node: gqlIssueObj(repo, issue), cursor: gqlCursorFor(issue.number) })),
+    pageInfo: {
+      __typename: 'PageInfo',
+      hasNextPage: start + slice.length < list.length,
+      hasPreviousPage: start > 0,
+      startCursor: slice.length > 0 ? gqlCursorFor((slice[0] as IssueRec).number) : null,
+      endCursor: slice.length > 0 ? gqlCursorFor((slice[slice.length - 1] as IssueRec).number) : null,
+    },
+    totalCount: list.length,
+  };
+}
+
+function gqlPullsConnection(repo: Repo, args: Record<string, unknown>): GqlObj {
+  const all = [...repo.pulls.values()].sort((a, b) => a.number - b.number);
+  const first = typeof args.first === 'number' && Number.isFinite(args.first) ? Math.max(0, Math.trunc(args.first)) : 30;
+  const slice = all.slice(0, first);
+  return {
+    __typename: 'PullRequestConnection',
+    nodes: slice.map((pull) => gqlPullObj(repo, pull)),
+    edges: slice.map((pull) => ({ __typename: 'PullRequestEdge', node: gqlPullObj(repo, pull), cursor: gqlCursorFor(pull.number) })),
+    pageInfo: {
+      __typename: 'PageInfo',
+      hasNextPage: slice.length < all.length,
+      hasPreviousPage: false,
+      startCursor: null,
+      endCursor: null,
+    },
+    totalCount: all.length,
+  };
+}
+
+function gqlTypeObj(name: string): GqlObj | null {
+  const kind = GQL_TYPE_KINDS[name];
+  if (kind === undefined) return null;
+  return { __typename: '__Type', name, kind };
+}
+
+const GQL_RESOLVERS: Record<string, Record<string, GqlResolver>> = {
+  Query: {
+    viewer: () => gqlUserObj(viewerLogin ?? ''),
+    repository: (_source, args) => {
+      const repo = repoForPath(typeof args.owner === 'string' ? args.owner : '', typeof args.name === 'string' ? args.name : '');
+      return repo === null ? null : gqlRepoObj(repo);
+    },
+    node: (_source, args) => {
+      const id = typeof args.id === 'string' ? args.id : '';
+      const repoHit = repoByGqlId(id);
+      if (repoHit !== null) return gqlRepoObj(repoHit);
+      const issueHit = issueByGqlId(id);
+      if (issueHit !== null) return gqlIssueObj(issueHit.repo, issueHit.issue);
+      const pullHit = pullByGqlId(id);
+      if (pullHit !== null) return gqlPullObj(pullHit.repo, pullHit.pull);
+      const commentHit = commentByGqlId(id);
+      if (commentHit !== null) return gqlCommentObj(commentHit.repo, commentHit.issueNumber, commentHit.comment);
+      const parsed = parseGqlId(id);
+      if (parsed !== null && parsed.type === 'User') return gqlUserObj(viewerLogin ?? '');
+      return null;
+    },
+    nodes: (_source, args, ctx) => {
+      const ids = Array.isArray(args.ids) ? args.ids : [];
+      const nodeResolver = GQL_RESOLVERS.Query.node as GqlResolver;
+      return ids.map((entry) => nodeResolver(_source, { id: entry }, ctx) as GqlObj | null);
+    },
+    user: (_source, args) => {
+      const login = typeof args.login === 'string' ? args.login : '';
+      if (viewerLogin !== null && login !== viewerLogin) return null;
+      return gqlUserObj(login);
+    },
+    __type: (_source, args) => gqlTypeObj(typeof args.name === 'string' ? args.name : ''),
+    __schema: () => ({ __typename: '__Schema' }),
+  },
+  Mutation: {
+    createIssue: (_source, args) => {
+      const input = (typeof args.input === 'object' && args.input !== null ? args.input : {}) as Record<string, unknown>;
+      const repo = repoByGqlId(typeof input.repositoryId === 'string' ? input.repositoryId : '');
+      if (repo === null) throw new GqlFieldError('Could not resolve the repository for createIssue');
+      const result = restCreateIssue(repo, {
+        title: typeof input.title === 'string' ? input.title : '',
+        body: typeof input.body === 'string' ? input.body : '',
+      });
+      if (result.status !== 201) throw new GqlFieldError(`createIssue failed: ${(result.body as Record<string, unknown>)?.message ?? result.status}`);
+      const number = (result.body as Record<string, unknown>).number as number;
+      const issue = repo.issues.get(number) as IssueRec;
+      return { __typename: 'CreateIssuePayload', issue: gqlIssueObj(repo, issue), clientMutationId: input.clientMutationId ?? null };
+    },
+    closeIssue: (_source, args) => {
+      const input = (typeof args.input === 'object' && args.input !== null ? args.input : {}) as Record<string, unknown>;
+      const hit = issueByGqlId(typeof input.issueId === 'string' ? input.issueId : '');
+      if (hit === null) throw new GqlFieldError('Could not resolve the issue for closeIssue');
+      const result = restPatchIssue(hit.repo, hit.issue.number, { state: 'closed' });
+      if (result.status !== 200) throw new GqlFieldError('closeIssue failed');
+      return { __typename: 'CloseIssuePayload', issue: gqlIssueObj(hit.repo, hit.issue), clientMutationId: input.clientMutationId ?? null };
+    },
+    createPullRequest: (_source, args) => {
+      const input = (typeof args.input === 'object' && args.input !== null ? args.input : {}) as Record<string, unknown>;
+      const repo = repoByGqlId(typeof input.repositoryId === 'string' ? input.repositoryId : '');
+      if (repo === null) throw new GqlFieldError('Could not resolve the repository for createPullRequest');
+      const result = restCreatePull(repo, {
+        title: typeof input.title === 'string' ? input.title : '',
+        body: typeof input.body === 'string' ? input.body : '',
+        head: typeof input.headRefName === 'string' ? input.headRefName : '',
+        base: typeof input.baseRefName === 'string' ? input.baseRefName : '',
+      });
+      if (result.status !== 201) throw new GqlFieldError(`createPullRequest failed: ${(result.body as Record<string, unknown>)?.message ?? result.status}`);
+      const number = (result.body as Record<string, unknown>).number as number;
+      const pull = repo.pulls.get(number) as PullRec;
+      return { __typename: 'CreatePullRequestPayload', pullRequest: gqlPullObj(repo, pull), clientMutationId: input.clientMutationId ?? null };
+    },
+    mergePullRequest: (_source, args) => {
+      const input = (typeof args.input === 'object' && args.input !== null ? args.input : {}) as Record<string, unknown>;
+      const hit = pullByGqlId(typeof input.pullRequestId === 'string' ? input.pullRequestId : '');
+      if (hit === null) throw new GqlFieldError('Could not resolve the pull request for mergePullRequest');
+      const method = typeof input.mergeMethod === 'string' ? input.mergeMethod.toLowerCase() : 'merge';
+      const result = restMergePull(hit.repo, hit.pull.number, { merge_method: method === 'merge' ? 'merge' : 'squash' });
+      if (result.status !== 200) throw new GqlFieldError(`mergePullRequest failed: ${(result.body as Record<string, unknown>)?.message ?? result.status}`);
+      return { __typename: 'MergePullRequestPayload', pullRequest: gqlPullObj(hit.repo, hit.pull), clientMutationId: input.clientMutationId ?? null };
+    },
+    addComment: (_source, args) => {
+      const input = (typeof args.input === 'object' && args.input !== null ? args.input : {}) as Record<string, unknown>;
+      const hit = issueByGqlId(typeof input.subjectId === 'string' ? input.subjectId : '');
+      if (hit === null) throw new GqlFieldError('Could not resolve the subject for addComment');
+      const result = restCreateComment(hit.repo, hit.issue.number, { body: typeof input.body === 'string' ? input.body : '' });
+      if (result.status !== 201) throw new GqlFieldError('addComment failed');
+      const comments = hit.repo.comments.get(hit.issue.number) ?? [];
+      const comment = comments[comments.length - 1] as CommentRec;
+      return {
+        __typename: 'AddCommentPayload',
+        commentEdge: { __typename: 'CommentEdge', node: gqlCommentObj(hit.repo, hit.issue.number, comment), cursor: gqlCursorFor(comment.id) },
+        subject: gqlIssueObj(hit.repo, hit.issue),
+        clientMutationId: input.clientMutationId ?? null,
+      };
+    },
+  },
+  User: {
+    id: () => gqlId('User', 1000),
+    login: (source) => source.login as string,
+    name: (source) => source.login as string,
+    email: () => '',
+    url: () => '',
+    avatarUrl: () => '',
+    databaseId: () => 1000,
+    isViewer: () => true,
+    createdAt: () => isoOf(CLOCK_BASE_SEC),
+    updatedAt: () => isoOf(CLOCK_BASE_SEC),
+  },
+  Repository: {
+    id: (source) => gqlId('Repository', (source.repo as Repo).id),
+    databaseId: (source) => (source.repo as Repo).id,
+    name: (source) => (source.repo as Repo).name,
+    nameWithOwner: (source) => {
+      const repo = source.repo as Repo;
+      return `${repo.owner ?? viewerLogin ?? ''}/${repo.name}`;
+    },
+    description: (source) => (source.repo as Repo).description,
+    isPrivate: (source) => (source.repo as Repo).isPrivate,
+    isFork: () => false,
+    isArchived: () => false,
+    isDisabled: () => false,
+    isEmpty: (source) => (source.repo as Repo).refs.size === 0,
+    owner: (source) => gqlUserObj((source.repo as Repo).owner ?? viewerLogin ?? ''),
+    defaultBranchRef: (source) => {
+      const repo = source.repo as Repo;
+      return repo.refs.has(`refs/heads/${repo.defaultBranch}`) ? { __typename: 'Ref', name: repo.defaultBranch, repo } : null;
+    },
+    viewerPermission: () => 'ADMIN',
+    hasIssuesEnabled: () => true,
+    hasProjectsEnabled: () => true,
+    hasWikiEnabled: () => true,
+    hasDiscussionsEnabled: () => false,
+    issue: (source, args) => {
+      const repo = source.repo as Repo;
+      const issue = repo.issues.get(typeof args.number === 'number' ? args.number : -1);
+      return issue === undefined ? null : gqlIssueObj(repo, issue);
+    },
+    issues: (source, args) => gqlIssuesConnection(source.repo as Repo, args),
+    pullRequest: (source, args) => {
+      const repo = source.repo as Repo;
+      const pull = repo.pulls.get(typeof args.number === 'number' ? args.number : -1);
+      return pull === undefined ? null : gqlPullObj(repo, pull);
+    },
+    pullRequests: (source, args) => gqlPullsConnection(source.repo as Repo, args),
+    createdAt: (source) => isoOf((source.repo as Repo).createdSec),
+    updatedAt: (source) => isoOf((source.repo as Repo).updatedSec),
+    pushedAt: (source) => isoOf((source.repo as Repo).updatedSec),
+    url: () => '',
+    sshUrl: () => '',
+    stargazerCount: () => 0,
+    forkCount: () => 0,
+  },
+  Ref: {
+    id: (source) => gqlId('Ref', 0),
+    name: (source) => source.name as string,
+    prefix: () => 'refs/heads/',
+    repository: (source) => (source.repo !== undefined ? gqlRepoObj(source.repo as Repo) : null),
+    target: () => null,
+  },
+  Issue: {
+    id: (source) => gqlId('Issue', (source.issue as IssueRec).id),
+    databaseId: (source) => (source.issue as IssueRec).id,
+    number: (source) => (source.issue as IssueRec).number,
+    title: (source) => (source.issue as IssueRec).title,
+    state: (source) => (source.issue as IssueRec).state.toUpperCase(),
+    body: (source) => (source.issue as IssueRec).body,
+    bodyText: (source) => (source.issue as IssueRec).body,
+    bodyHTML: (source) => (source.issue as IssueRec).body,
+    author: (source) => gqlUserObj(viewerLogin ?? (source.repo as Repo).owner ?? ''),
+    repository: (source) => gqlRepoObj(source.repo as Repo),
+    labels: (source) => {
+      const repo = source.repo as Repo;
+      const issue = source.issue as IssueRec;
+      const nodes = issue.labels
+        .map((name) => repo.labels.get(name))
+        .filter((label): label is LabelRec => label !== undefined)
+        .map((label) => ({ __typename: 'Label', label }));
+      return { __typename: 'LabelConnection', nodes, edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: nodes.length };
+    },
+    comments: (source) => {
+      const repo = source.repo as Repo;
+      const issue = source.issue as IssueRec;
+      const nodes = (repo.comments.get(issue.number) ?? []).map((comment) => gqlCommentObj(repo, issue.number, comment));
+      return { __typename: 'IssueCommentConnection', nodes, edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: nodes.length };
+    },
+    assignees: () => ({ __typename: 'UserConnection', nodes: [], edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: 0 }),
+    milestone: () => null,
+    createdAt: (source) => isoOf((source.issue as IssueRec).createdSec),
+    updatedAt: (source) => isoOf((source.issue as IssueRec).updatedSec),
+    closedAt: (source) => {
+      const issue = source.issue as IssueRec;
+      return issue.state === 'closed' ? isoOf(issue.updatedSec) : null;
+    },
+    closed: (source) => (source.issue as IssueRec).state === 'closed',
+    url: () => '',
+    viewerCanUpdate: () => true,
+    viewerCanDelete: () => true,
+    viewerDidAuthor: () => true,
+    locked: () => false,
+    activeLockReason: () => null,
+    stateReason: () => null,
+  },
+  PullRequest: {
+    id: (source) => gqlId('PullRequest', (source.pull as PullRec).id),
+    databaseId: (source) => (source.pull as PullRec).id,
+    number: (source) => (source.pull as PullRec).number,
+    title: (source) => (source.pull as PullRec).title,
+    state: (source) => {
+      const pull = source.pull as PullRec;
+      return pull.merged ? 'MERGED' : pull.state.toUpperCase();
+    },
+    body: (source) => (source.pull as PullRec).body,
+    bodyText: (source) => (source.pull as PullRec).body,
+    author: (source) => gqlUserObj(viewerLogin ?? (source.repo as Repo).owner ?? ''),
+    repository: (source) => gqlRepoObj(source.repo as Repo),
+    merged: (source) => (source.pull as PullRec).merged,
+    mergedAt: (source) => {
+      const pull = source.pull as PullRec;
+      return pull.mergedAtSec === null ? null : isoOf(pull.mergedAtSec);
+    },
+    mergeable: (source) => pullMergeableState(source.repo as Repo, source.pull as PullRec),
+    headRefName: (source) => (source.pull as PullRec).headRef,
+    baseRefName: (source) => (source.pull as PullRec).baseRef,
+    headRef: (source) => {
+      const repo = source.repo as Repo;
+      const pull = source.pull as PullRec;
+      return repo.refs.has(`refs/heads/${pull.headRef}`) ? { __typename: 'Ref', name: pull.headRef, repo } : null;
+    },
+    baseRef: (source) => {
+      const repo = source.repo as Repo;
+      const pull = source.pull as PullRec;
+      return repo.refs.has(`refs/heads/${pull.baseRef}`) ? { __typename: 'Ref', name: pull.baseRef, repo } : null;
+    },
+    files: (source, args) => {
+      const repo = source.repo as Repo;
+      const pull = source.pull as PullRec;
+      const all = pullChangedFiles(repo, pull);
+      const first = typeof args.first === 'number' && Number.isFinite(args.first) ? Math.max(0, Math.trunc(args.first)) : 30;
+      const nodes = all.slice(0, first).map((file) => ({
+        __typename: 'PullRequestChangedFile',
+        path: file.path,
+        additions: file.additions,
+        deletions: file.deletions,
+        changeType: file.status.toUpperCase(),
+      }));
+      return { __typename: 'PullRequestChangedFileConnection', nodes, edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: nodes.length < all.length, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: all.length };
+    },
+    commits: () => ({ __typename: 'PullRequestCommitConnection', nodes: [], edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: 0 }),
+    comments: () => ({ __typename: 'IssueCommentConnection', nodes: [], edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: 0 }),
+    reviews: () => ({ __typename: 'PullRequestReviewConnection', nodes: [], edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: 0 }),
+    labels: () => ({ __typename: 'LabelConnection', nodes: [], edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: 0 }),
+    assignees: () => ({ __typename: 'UserConnection', nodes: [], edges: [], pageInfo: { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null }, totalCount: 0 }),
+    additions: (source) => pullChangedFiles(source.repo as Repo, source.pull as PullRec).reduce((sum, file) => sum + file.additions, 0),
+    deletions: (source) => pullChangedFiles(source.repo as Repo, source.pull as PullRec).reduce((sum, file) => sum + file.deletions, 0),
+    changedFiles: (source) => pullChangedFiles(source.repo as Repo, source.pull as PullRec).length,
+    createdAt: (source) => isoOf((source.pull as PullRec).createdSec),
+    updatedAt: (source) => isoOf((source.pull as PullRec).updatedSec),
+    closedAt: (source) => {
+      const pull = source.pull as PullRec;
+      return pull.state === 'closed' ? isoOf(pull.updatedSec) : null;
+    },
+    closed: (source) => (source.pull as PullRec).state === 'closed',
+    url: () => '',
+    isDraft: () => false,
+    viewerCanUpdate: () => true,
+    maintainerCanModify: () => true,
+    mergeStateStatus: () => 'CLEAN',
+    mergeCommit: () => null,
+    potentialMergeCommit: () => null,
+  },
+  IssueComment: {
+    id: (source) => gqlId('IssueComment', (source.comment as CommentRec).id),
+    databaseId: (source) => (source.comment as CommentRec).id,
+    body: (source) => (source.comment as CommentRec).body,
+    bodyText: (source) => (source.comment as CommentRec).body,
+    author: (source) => gqlUserObj(viewerLogin ?? (source.repo as Repo).owner ?? ''),
+    createdAt: (source) => isoOf((source.comment as CommentRec).createdSec),
+    updatedAt: (source) => isoOf((source.comment as CommentRec).updatedSec),
+    url: () => '',
+    viewerCanUpdate: () => true,
+    viewerCanDelete: () => true,
+  },
+  Label: {
+    id: (source) => gqlId('Label', (source.label as LabelRec).id),
+    name: (source) => (source.label as LabelRec).name,
+    color: (source) => (source.label as LabelRec).color,
+    description: (source) => (source.label as LabelRec).description,
+    isDefault: () => false,
+    url: () => '',
+  },
+  PageInfo: {
+    hasNextPage: (source) => source.hasNextPage as boolean,
+    hasPreviousPage: (source) => source.hasPreviousPage as boolean,
+    startCursor: (source) => (source.startCursor as string | null) ?? null,
+    endCursor: (source) => (source.endCursor as string | null) ?? null,
+  },
+  IssueConnection: {
+    nodes: (source) => source.nodes as GqlObj[],
+    edges: (source) => source.edges as GqlObj[],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => source.totalCount as number,
+  },
+  UserConnection: {
+    nodes: (source) => (source.nodes as GqlObj[] | undefined) ?? [],
+    edges: (source) => (source.edges as GqlObj[] | undefined) ?? [],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => (source.totalCount as number | undefined) ?? 0,
+  },
+  PullRequestCommitConnection: {
+    nodes: (source) => (source.nodes as GqlObj[] | undefined) ?? [],
+    edges: (source) => (source.edges as GqlObj[] | undefined) ?? [],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => (source.totalCount as number | undefined) ?? 0,
+  },
+  PullRequestReviewConnection: {
+    nodes: (source) => (source.nodes as GqlObj[] | undefined) ?? [],
+    edges: (source) => (source.edges as GqlObj[] | undefined) ?? [],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => (source.totalCount as number | undefined) ?? 0,
+  },
+  IssueEdge: {
+    node: (source) => source.node as GqlObj,
+    cursor: (source) => source.cursor as string,
+  },
+  PullRequestConnection: {
+    nodes: (source) => source.nodes as GqlObj[],
+    edges: (source) => source.edges as GqlObj[],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => source.totalCount as number,
+  },
+  PullRequestEdge: {
+    node: (source) => source.node as GqlObj,
+    cursor: (source) => source.cursor as string,
+  },
+  PullRequestChangedFileConnection: {
+    nodes: (source) => source.nodes as GqlObj[],
+    edges: (source) => (source.edges as GqlObj[] | undefined) ?? [],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => source.totalCount as number,
+  },
+  PullRequestChangedFile: {
+    path: (source) => source.path as string,
+    additions: (source) => source.additions as number,
+    deletions: (source) => source.deletions as number,
+    changeType: (source) => source.changeType as string,
+  },
+  IssueCommentConnection: {
+    nodes: (source) => source.nodes as GqlObj[],
+    edges: (source) => (source.edges as GqlObj[] | undefined) ?? [],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => source.totalCount as number,
+  },
+  LabelConnection: {
+    nodes: (source) => source.nodes as GqlObj[],
+    edges: (source) => (source.edges as GqlObj[] | undefined) ?? [],
+    pageInfo: (source) => source.pageInfo as GqlObj,
+    totalCount: (source) => source.totalCount as number,
+  },
+  CommentEdge: {
+    node: (source) => source.node as GqlObj,
+    cursor: (source) => source.cursor as string,
+  },
+  CreateIssuePayload: {
+    issue: (source) => source.issue as GqlObj,
+    clientMutationId: (source) => (source.clientMutationId as string | null) ?? null,
+  },
+  CloseIssuePayload: {
+    issue: (source) => source.issue as GqlObj,
+    clientMutationId: (source) => (source.clientMutationId as string | null) ?? null,
+  },
+  CreatePullRequestPayload: {
+    pullRequest: (source) => source.pullRequest as GqlObj,
+    clientMutationId: (source) => (source.clientMutationId as string | null) ?? null,
+  },
+  MergePullRequestPayload: {
+    pullRequest: (source) => source.pullRequest as GqlObj,
+    clientMutationId: (source) => (source.clientMutationId as string | null) ?? null,
+  },
+  AddCommentPayload: {
+    commentEdge: (source) => source.commentEdge as GqlObj,
+    subject: (source) => source.subject as GqlObj,
+    clientMutationId: (source) => (source.clientMutationId as string | null) ?? null,
+  },
+  __Type: {
+    name: (source) => source.name as string,
+    kind: (source) => source.kind as string,
+    description: () => null,
+    fields: (source) => {
+      const name = source.name as string;
+      if (source.kind !== 'OBJECT' && source.kind !== 'INTERFACE') return null;
+      return (GQL_TYPE_FIELDS[name] ?? []).map((fieldName) => ({ __typename: '__Field', name: fieldName }));
+    },
+    enumValues: (source) => {
+      const name = source.name as string;
+      if (source.kind !== 'ENUM') return null;
+      return (GQL_ENUM_VALUES[name] ?? []).map((valueName) => ({ __typename: '__EnumValue', name: valueName }));
+    },
+    possibleTypes: () => null,
+    inputFields: () => null,
+    ofType: () => null,
+    specifiedByURL: () => null,
+    interfaces: () => [],
+  },
+  __Field: {
+    name: (source) => source.name as string,
+    description: () => null,
+    args: () => [],
+    type: () => null,
+    isDeprecated: () => false,
+    deprecationReason: () => null,
+  },
+  __EnumValue: {
+    name: (source) => source.name as string,
+    description: () => null,
+    isDeprecated: () => false,
+    deprecationReason: () => null,
+  },
+  __Schema: {
+    queryType: () => gqlTypeObj('Query'),
+    mutationType: () => gqlTypeObj('Mutation'),
+    subscriptionType: () => null,
+    types: () => Object.keys(GQL_TYPE_KINDS).sort().map((name) => gqlTypeObj(name)),
+    directives: () => [],
+    description: () => null,
+  },
+};
+
+function gqlResolveValue(value: GqlValue, ctx: GqlExecCtx): unknown {
+  switch (value.kind) {
+    case 'variable':
+      return ctx.variables[value.name];
+    case 'string':
+    case 'int':
+    case 'float':
+    case 'boolean':
+    case 'enum':
+      return value.value;
+    case 'null':
+      return null;
+    case 'list':
+      return value.values.map((entry) => gqlResolveValue(entry, ctx));
+    case 'object': {
+      const out: Record<string, unknown> = {};
+      for (const field of value.fields) out[field.name] = gqlResolveValue(field.value, ctx);
+      return out;
+    }
+  }
+}
+
+function gqlCompleteValue(value: unknown, selectionSet: GqlSelection[] | null, ctx: GqlExecCtx, path: (string | number)[]): unknown {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) return value.map((entry, index) => gqlCompleteValue(entry, selectionSet, ctx, [...path, index]));
+  if (typeof value === 'object' && typeof (value as GqlObj).__typename === 'string') {
+    const obj = value as GqlObj;
+    return gqlExecuteSelectionSet(obj.__typename, obj, selectionSet ?? [], ctx, path);
+  }
+  return value;
+}
+
+function gqlExecuteSelectionSet(
+  typeName: string,
+  source: GqlObj,
+  selections: GqlSelection[],
+  ctx: GqlExecCtx,
+  path: (string | number)[],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const applySelections = (currentType: string, currentSource: GqlObj, currentSelections: GqlSelection[]): void => {
+    for (const selection of currentSelections) {
+      if (selection.kind === 'inline') {
+        if (selection.typeCondition === null || selection.typeCondition === currentType) {
+          applySelections(currentType, currentSource, selection.selectionSet);
+        }
+        continue;
+      }
+      if (selection.kind === 'spread') {
+        const fragment = ctx.fragments.get(selection.name);
+        if (fragment !== undefined && (fragment.typeCondition === null || fragment.typeCondition === currentType)) {
+          applySelections(currentType, currentSource, fragment.selectionSet);
+        }
+        continue;
+      }
+      const key = selection.alias ?? selection.name;
+      if (selection.name === '__typename') {
+        out[key] = currentType;
+        continue;
+      }
+      const resolver = GQL_RESOLVERS[currentType]?.[selection.name];
+      if (resolver === undefined) {
+        ctx.errors.push({ message: `Field '${selection.name}' doesn't exist on type '${currentType}'`, path: [...path, key] });
+        out[key] = null;
+        continue;
+      }
+      const args: Record<string, unknown> = {};
+      for (const arg of selection.args) args[arg.name] = gqlResolveValue(arg.value, ctx);
+      let raw: unknown;
+      try {
+        raw = resolver(currentSource, args, ctx);
+      } catch (err) {
+        ctx.errors.push({ message: err instanceof Error ? err.message : String(err), path: [...path, key] });
+        out[key] = null;
+        continue;
+      }
+      out[key] = gqlCompleteValue(raw, selection.selectionSet, ctx, [...path, key]);
+    }
+  };
+  applySelections(typeName, source, selections);
+  return out;
+}
+
+/** Execute one operation document (a single entry of a possibly batched request). */
+function executeGraphqlOperation(body: Record<string, unknown>): Record<string, unknown> {
+  if (typeof body.query !== 'string' || body.query === '') {
+    return { errors: [{ message: 'Must provide query string.' }] };
+  }
+  let document: GqlDocument;
+  try {
+    document = new GqlParser(body.query).parseDocument();
+  } catch (err) {
+    return { errors: [{ message: err instanceof Error ? err.message : String(err) }] };
+  }
+  const variables = (typeof body.variables === 'object' && body.variables !== null ? body.variables : {}) as Record<string, unknown>;
+  let operation: GqlOperation | undefined;
+  if (typeof body.operationName === 'string') operation = document.operations.find((entry) => entry.name === body.operationName);
+  operation ??= document.operations[0];
+  if (operation === undefined) return { errors: [{ message: 'No operation found in the document.' }] };
+  const ctx: GqlExecCtx = { variables, fragments: document.fragments, errors: [] };
+  const rootType = operation.operation === 'mutation' ? 'Mutation' : 'Query';
+  const data = gqlExecuteSelectionSet(rootType, { __typename: rootType }, operation.selectionSet, ctx, []);
+  const out: Record<string, unknown> = { data };
+  if (ctx.errors.length > 0) out.errors = ctx.errors;
+  return out;
+}
+
+async function handleGraphqlRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { message: 'Method Not Allowed' });
+    return;
+  }
+  if (!authorized(req)) {
+    sendJson(res, 401, { message: 'Bad credentials' });
+    return;
+  }
+  const raw = await readBody(req);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString('utf8'));
+  } catch {
+    sendJson(res, 400, { errors: [{ message: 'Problems parsing JSON' }] });
+    return;
+  }
+  if (Array.isArray(parsed)) {
+    const responses = parsed.map((entry) =>
+      typeof entry === 'object' && entry !== null ? executeGraphqlOperation(entry as Record<string, unknown>) : { errors: [{ message: 'Invalid operation entry.' }] },
+    );
+    sendJson(res, 200, responses);
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    sendJson(res, 400, { errors: [{ message: 'Invalid request body.' }] });
+    return;
+  }
+  sendJson(res, 200, executeGraphqlOperation(parsed as Record<string, unknown>));
+}
+
+// --------------------------------------------------------------------------- MCP (agent-native surface)
+//
+// The Model Context Protocol endpoint at /mcp, Streamable HTTP. Speaks the modern 2026-07-28
+// era (server/discover, no session) and answers the legacy initialize handshake too. Tools act
+// on the same store as REST and GraphQL — every tool is a thin call into the REST handlers.
+
+const MCP_SERVER_INFO = { name: 'makefun-forge', version: FORGE_VERSION };
+const MCP_SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+
+const MCP_TOOLS: readonly Record<string, unknown>[] = Object.freeze([
+  {
+    name: 'create_repo',
+    description: 'Create a new repository owned by the authenticated user.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'The name of the repository to create.' },
+        description: { type: 'string', description: 'A short description of the repository.' },
+        private: { type: 'boolean', description: 'Whether the repository is private.' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'get_repo',
+    description: 'Get a repository by its owner and name.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'The repository owner login.' },
+        repo: { type: 'string', description: 'The repository name.' },
+      },
+      required: ['owner', 'repo'],
+    },
+  },
+  {
+    name: 'create_issue',
+    description: 'Create an issue in a repository.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'The repository owner login.' },
+        repo: { type: 'string', description: 'The repository name.' },
+        title: { type: 'string', description: 'The issue title.' },
+        body: { type: 'string', description: 'The issue body.' },
+      },
+      required: ['owner', 'repo', 'title'],
+    },
+  },
+  {
+    name: 'list_issues',
+    description: 'List the issues of a repository, optionally filtered by state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'The repository owner login.' },
+        repo: { type: 'string', description: 'The repository name.' },
+        state: { type: 'string', description: 'Filter by state: open, closed or all.' },
+      },
+      required: ['owner', 'repo'],
+    },
+  },
+  {
+    name: 'create_pull_request',
+    description: 'Create a pull request from a head branch into a base branch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'The repository owner login.' },
+        repo: { type: 'string', description: 'The repository name.' },
+        title: { type: 'string', description: 'The pull request title.' },
+        body: { type: 'string', description: 'The pull request body.' },
+        head: { type: 'string', description: 'The head branch to merge from.' },
+        base: { type: 'string', description: 'The base branch to merge into.' },
+      },
+      required: ['owner', 'repo', 'title', 'head', 'base'],
+    },
+  },
+  {
+    name: 'merge_pull_request',
+    description: 'Merge a pull request by number.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'The repository owner login.' },
+        repo: { type: 'string', description: 'The repository name.' },
+        pull_number: { type: 'number', description: 'The pull request number to merge.' },
+      },
+      required: ['owner', 'repo', 'pull_number'],
+    },
+  },
+]);
+
+const MCP_TOOL_NAMES = new Set(MCP_TOOLS.map((tool) => tool.name as string));
+
+function mcpToolSuccess(value: unknown): Record<string, unknown> {
+  return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, isError: false };
+}
+
+function mcpToolFailure(message: string): Record<string, unknown> {
+  return { content: [{ type: 'text', text: message }], isError: true };
+}
+
+/** Run one tool against the store; tool-level problems are isError results, never throws. */
+function mcpCallTool(name: string, args: Record<string, unknown>): Record<string, unknown> {
+  const str = (value: unknown): string => (typeof value === 'string' ? value : '');
+  const repoArg = (): Repo | null => {
+    const owner = str(args.owner);
+    const repoName = str(args.repo);
+    if (owner === '' || repoName === '') return null;
+    return repoForPath(owner, repoName);
+  };
+  switch (name) {
+    case 'create_repo': {
+      const repoName = str(args.name);
+      if (repoName === '') return mcpToolFailure('create_repo requires a "name" argument');
+      const result = restCreateRepo({
+        name: repoName,
+        description: typeof args.description === 'string' ? args.description : undefined,
+        private: typeof args.private === 'boolean' ? args.private : undefined,
+      });
+      if (result.status !== 201) return mcpToolFailure(`create_repo failed: ${(result.body as Record<string, unknown>)?.message ?? `HTTP ${result.status}`}`);
+      return mcpToolSuccess(result.body);
+    }
+    case 'get_repo': {
+      const repo = repoArg();
+      if (repo === null) return mcpToolFailure(`repository ${str(args.owner)}/${str(args.repo)} was not found`);
+      return mcpToolSuccess(repoJson(repo));
+    }
+    case 'create_issue': {
+      const repo = repoArg();
+      if (repo === null) return mcpToolFailure(`repository ${str(args.owner)}/${str(args.repo)} was not found`);
+      const title = str(args.title);
+      if (title === '') return mcpToolFailure('create_issue requires a "title" argument');
+      const result = restCreateIssue(repo, { title, body: str(args.body) });
+      if (result.status !== 201) return mcpToolFailure(`create_issue failed: ${(result.body as Record<string, unknown>)?.message ?? `HTTP ${result.status}`}`);
+      return mcpToolSuccess(result.body);
+    }
+    case 'list_issues': {
+      const repo = repoArg();
+      if (repo === null) return mcpToolFailure(`repository ${str(args.owner)}/${str(args.repo)} was not found`);
+      const state = str(args.state);
+      let issues = [...repo.issues.values()];
+      if (state === 'open' || state === 'closed') issues = issues.filter((issue) => issue.state === state);
+      issues.sort((a, b) => a.number - b.number);
+      return mcpToolSuccess(issues.map((issue) => issueJson(repo, issue)));
+    }
+    case 'create_pull_request': {
+      const repo = repoArg();
+      if (repo === null) return mcpToolFailure(`repository ${str(args.owner)}/${str(args.repo)} was not found`);
+      const result = restCreatePull(repo, { title: str(args.title), body: str(args.body), head: str(args.head), base: str(args.base) });
+      if (result.status !== 201) return mcpToolFailure(`create_pull_request failed: ${(result.body as Record<string, unknown>)?.message ?? `HTTP ${result.status}`}`);
+      return mcpToolSuccess(result.body);
+    }
+    case 'merge_pull_request': {
+      const repo = repoArg();
+      if (repo === null) return mcpToolFailure(`repository ${str(args.owner)}/${str(args.repo)} was not found`);
+      const number = typeof args.pull_number === 'number' ? args.pull_number : Number(args.pull_number);
+      if (!Number.isInteger(number) || number < 1) return mcpToolFailure('merge_pull_request requires a "pull_number" argument');
+      const result = restMergePull(repo, number, {});
+      if (result.status !== 200) return mcpToolFailure(`merge_pull_request failed: ${(result.body as Record<string, unknown>)?.message ?? `HTTP ${result.status}`}`);
+      const pull = repo.pulls.get(number) as PullRec;
+      return mcpToolSuccess(pullJson(repo, pull));
+    }
+    default:
+      return mcpToolFailure(`unknown tool: ${name}`);
+  }
+}
+
+/** Dispatch one JSON-RPC message; returns the response object, or null for a notification. */
+function mcpDispatch(message: Record<string, unknown>): Record<string, unknown> | null {
+  const method = typeof message.method === 'string' ? message.method : '';
+  const hasId = 'id' in message;
+  const id = hasId ? message.id : null;
+  const params = (typeof message.params === 'object' && message.params !== null ? message.params : {}) as Record<string, unknown>;
+  const respond = (result: unknown): Record<string, unknown> => ({ jsonrpc: '2.0', id, result });
+  const respondError = (code: number, text: string): Record<string, unknown> => ({ jsonrpc: '2.0', id, error: { code, message: text } });
+  switch (method) {
+    case 'server/discover':
+      return respond({
+        resultType: 'complete',
+        supportedVersions: MCP_SUPPORTED_VERSIONS,
+        capabilities: { tools: {} },
+        serverInfo: MCP_SERVER_INFO,
+        _meta: { 'io.modelcontextprotocol/serverInfo': MCP_SERVER_INFO },
+      });
+    case 'initialize':
+      return respond({
+        protocolVersion:
+          typeof params.protocolVersion === 'string' && MCP_SUPPORTED_VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : '2025-11-25',
+        capabilities: { tools: {} },
+        serverInfo: MCP_SERVER_INFO,
+      });
+    case 'ping':
+      return respond({});
+    case 'tools/list':
+      return respond({ tools: MCP_TOOLS });
+    case 'tools/call': {
+      const name = typeof params.name === 'string' ? params.name : '';
+      if (!MCP_TOOL_NAMES.has(name)) return respondError(-32602, `Unknown tool: ${name}`);
+      const toolArgs = (typeof params.arguments === 'object' && params.arguments !== null ? params.arguments : {}) as Record<string, unknown>;
+      try {
+        return respond(mcpCallTool(name, toolArgs));
+      } catch (err) {
+        return respond(mcpToolFailure(err instanceof Error ? err.message : String(err)));
+      }
+    }
+    default:
+      if (!hasId || method.startsWith('notifications/')) return null;
+      return respondError(-32601, `Method not found: ${method}`);
+  }
+}
+
+async function handleMcpRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method === 'DELETE') {
+    // A legacy session close; the forge keeps no sessions, so this is a polite no-op.
+    res.writeHead(200, { 'x-github-request-id': nextRequestId() });
+    res.end();
+    return;
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { message: 'Method Not Allowed' });
+    return;
+  }
+  const raw = (await readBody(req)).toString('utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+    return;
+  }
+  if (!authorized(req)) {
+    sendJson(res, 401, { message: 'Bad credentials' });
+    return;
+  }
+  if (Array.isArray(parsed)) {
+    const responses: Record<string, unknown>[] = [];
+    for (const entry of parsed) {
+      if (typeof entry === 'object' && entry !== null) {
+        const response = mcpDispatch(entry as Record<string, unknown>);
+        if (response !== null) responses.push(response);
+      }
+    }
+    sendJson(res, 200, responses);
+    return;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+    return;
+  }
+  const response = mcpDispatch(parsed as Record<string, unknown>);
+  if (response === null) {
+    res.writeHead(202, { 'x-github-request-id': nextRequestId() });
+    res.end();
+    return;
+  }
+  sendJson(res, 200, response);
+}
+
 // --------------------------------------------------------------------------- HTTP plumbing
 
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -2062,6 +3471,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (segments[0] === 'api' && segments[1] === 'v3') {
     await handleApiRoute(req, res, segments, url.searchParams, host, rawPath);
+    return;
+  }
+
+  if (segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) {
+    await handleGraphqlRoute(req, res);
+    return;
+  }
+
+  if (segments.length === 1 && segments[0] === 'mcp') {
+    await handleMcpRoute(req, res);
     return;
   }
 
