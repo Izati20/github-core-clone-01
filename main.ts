@@ -25,8 +25,14 @@ function nowSec(): number {
   clockTick += 1;
   return CLOCK_BASE_SEC + clockTick;
 }
+const isoCache = new Map<number, string>();
 function isoOf(sec: number): string {
-  return new Date(sec * 1000).toISOString();
+  const hit = isoCache.get(sec);
+  if (hit !== undefined) return hit;
+  const iso = new Date(sec * 1000).toISOString();
+  if (isoCache.size >= 8192) isoCache.clear();
+  isoCache.set(sec, iso);
+  return iso;
 }
 function stampNow(): { sec: number; iso: string } {
   const sec = nowSec();
@@ -465,6 +471,9 @@ interface IssueRec {
   labels: string[]; // label names
   createdSec: number;
   updatedSec: number;
+  /** Memoized serialized GET payload (see issuePayload). */
+  payloadKey?: string;
+  payloadBuf?: Buffer;
 }
 
 interface CommentRec {
@@ -1271,6 +1280,23 @@ function issueJson(repo: Repo, issue: IssueRec): Record<string, unknown> {
   };
 }
 
+/**
+ * The serialized form of issueJson for the REST GET path, memoized on the record. The
+ * payload depends only on (updatedSec, comment count, viewer login): title/body/state/
+ * labels change only through restPatchIssue, which always advances updatedSec on the
+ * monotonic logical clock; comments change only through restCreateComment, which changes
+ * the count; label records are create-only and immutable. Any other key component change
+ * simply misses and re-serializes.
+ */
+function issuePayload(repo: Repo, issue: IssueRec): Buffer {
+  const key = `${issue.updatedSec}|${(repo.comments.get(issue.number) ?? []).length}|${viewerLogin ?? repo.owner ?? ''}`;
+  if (issue.payloadKey === key && issue.payloadBuf !== undefined) return issue.payloadBuf;
+  const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issue.payloadKey = key;
+  issue.payloadBuf = buf;
+  return buf;
+}
+
 function commentJson(comment: CommentRec): Record<string, unknown> {
   return {
     id: comment.id,
@@ -1332,6 +1358,8 @@ function commitJson(repo: Repo, oid: string): Record<string, unknown> {
 interface ApiResult {
   status: number;
   body?: unknown;
+  /** Pre-serialized JSON body; sent verbatim via sendRawJson when present. */
+  rawJson?: Buffer;
   headers?: Record<string, string>;
 }
 
@@ -1629,6 +1657,7 @@ function restCreateIssue(repo: Repo, body: Record<string, unknown>): ApiResult {
   nextIssueId += 1;
   repo.nextNumber += 1;
   repo.issues.set(issue.number, issue);
+  issuePayload(repo, issue); // prime the GET cache
   return { status: 201, body: issueJson(repo, issue) };
 }
 
@@ -1645,7 +1674,7 @@ function restListIssues(repo: Repo, query: URLSearchParams, host: string, path: 
 function restGetIssue(repo: Repo, number: number): ApiResult {
   const issue = repo.issues.get(number);
   if (!issue) return apiError(404, 'Not Found');
-  return { status: 200, body: issueJson(repo, issue) };
+  return { status: 200, rawJson: issuePayload(repo, issue) };
 }
 
 function restPatchIssue(repo: Repo, number: number, body: Record<string, unknown>): ApiResult {
@@ -1660,6 +1689,7 @@ function restPatchIssue(repo: Repo, number: number, body: Record<string, unknown
     issue.labels = labels;
   }
   issue.updatedSec = stampNow().sec;
+  issuePayload(repo, issue); // prime the GET cache for the new state
   return { status: 200, body: issueJson(repo, issue) };
 }
 
@@ -3262,10 +3292,9 @@ function nextRequestId(): string {
 function authorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return false;
-  const match = /^Bearer (.+)$/.exec(header);
-  if (!match) return false;
+  if (header.length <= 'Bearer '.length || !header.startsWith('Bearer ')) return false;
   if (EXPECTED_TOKEN === '') return true; // local dev without a configured token: any bearer token names the viewer
-  return match[1] === EXPECTED_TOKEN;
+  return header.slice('Bearer '.length) === EXPECTED_TOKEN;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -3275,6 +3304,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     'x-github-request-id': nextRequestId(),
     // An explicit length keeps responses off chunked framing: one write, no chunk markers.
     ...(payload !== '' ? { 'content-length': Buffer.byteLength(payload) } : {}),
+    ...headers,
+  });
+  res.end(payload);
+}
+
+/** Send a pre-serialized JSON payload verbatim: no re-stringify, no re-encode. */
+function sendRawJson(res: ServerResponse, status: number, payload: Buffer, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': nextRequestId(),
+    'content-length': payload.length,
     ...headers,
   });
   res.end(payload);
@@ -3293,7 +3333,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -3369,7 +3409,7 @@ function gitCachePut(key: string, entry: GitCacheEntry): void {
 
 // --------------------------------------------------------------------------- routing
 
-async function handleGitRoute(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, tail: string): Promise<void> {
+async function handleGitRoute(req: IncomingMessage, res: ServerResponse, owner: string, repoName: string, tail: string, query: URLSearchParams): Promise<void> {
   if (!authorized(req)) {
     sendJson(res, 401, { message: 'Bad credentials' });
     return;
@@ -3379,9 +3419,8 @@ async function handleGitRoute(req: IncomingMessage, res: ServerResponse, owner: 
     sendJson(res, 404, { message: 'Not Found' });
     return;
   }
-  const url = new URL(req.url ?? '/', 'http://forge.invalid');
   if (tail === 'info/refs' && req.method === 'GET') {
-    const service = url.searchParams.get('service');
+    const service = query.get('service');
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
       sendJson(res, 400, { message: 'Unsupported service' });
       return;
@@ -3434,6 +3473,10 @@ async function handleApiRoute(req: IncomingMessage, res: ServerResponse, segment
     if (result.status === 204) {
       res.writeHead(204, { 'x-github-request-id': nextRequestId() });
       res.end();
+      return;
+    }
+    if (result.rawJson !== undefined) {
+      sendRawJson(res, result.status, result.rawJson, result.headers ?? {});
       return;
     }
     sendJson(res, result.status, result.body, result.headers ?? {});
@@ -3596,18 +3639,30 @@ async function handleApiRoute(req: IncomingMessage, res: ServerResponse, segment
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://forge.invalid');
-  const rawPath = url.pathname;
-  const segments = rawPath
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map((segment) => {
-      try {
-        return decodeURIComponent(segment);
-      } catch {
-        return segment;
-      }
-    });
+  const rawTarget = req.url ?? '/';
+  const qmark = rawTarget.indexOf('?');
+  let rawPath = qmark === -1 ? rawTarget : rawTarget.slice(0, qmark);
+  let query = new URLSearchParams(qmark === -1 ? '' : rawTarget.slice(qmark + 1));
+  let segments: string[];
+  if (!/[%\\#]/.test(rawPath) && !rawPath.includes('..') && !/(^|\/)\.(\/|$)/.test(rawPath) && !/^https?:\/\//i.test(rawTarget)) {
+    // Fast path: an escape-free origin-form path splits and decodes to itself, so the
+    // WHATWG URL parse and the per-segment decodeURIComponent are pure overhead.
+    segments = rawPath.split('/').filter((segment) => segment !== '');
+  } else {
+    const url = new URL(rawTarget, 'http://forge.invalid');
+    rawPath = url.pathname;
+    query = url.searchParams;
+    segments = rawPath
+      .split('/')
+      .filter((segment) => segment !== '')
+      .map((segment) => {
+        try {
+          return decodeURIComponent(segment);
+        } catch {
+          return segment;
+        }
+      });
+  }
   const host = (req.headers.host as string | undefined) ?? '127.0.0.1';
 
   if (rawPath === '/healthz') {
@@ -3621,17 +3676,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const repoName = (segments[1] as string).slice(0, -'.git'.length);
     const tail = segments[2] as string;
     if (tail === 'info/refs' || tail === 'git-upload-pack' || tail === 'git-receive-pack') {
-      await handleGitRoute(req, res, owner, repoName, tail);
+      await handleGitRoute(req, res, owner, repoName, tail, query);
       return;
     }
   }
   if (segments.length === 4 && (segments[1] as string).endsWith('.git') && segments[2] === 'info' && segments[3] === 'refs') {
-    await handleGitRoute(req, res, segments[0] as string, (segments[1] as string).slice(0, -'.git'.length), 'info/refs');
+    await handleGitRoute(req, res, segments[0] as string, (segments[1] as string).slice(0, -'.git'.length), 'info/refs', query);
     return;
   }
 
   if (segments[0] === 'api' && segments[1] === 'v3') {
-    await handleApiRoute(req, res, segments, url.searchParams, host, rawPath);
+    await handleApiRoute(req, res, segments, query, host, rawPath);
     return;
   }
 
@@ -3646,6 +3701,88 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 
   sendJson(res, 404, { message: 'Not Found' });
+}
+
+// --------------------------------------------------------------------------- startup self-warm
+
+/**
+ * Exercise the hot request paths (advertise, ls-refs/fetch, issue CRUD, receive-pack)
+ * against a scratch repository that is never registered, so the JIT compiles them before
+ * the first real request arrives. Every module counter the rounds advance is snapshotted
+ * and restored, and the scratch repo is dropped, so the forge's observable state is
+ * exactly what it would have been without the warmup.
+ */
+async function selfWarm(): Promise<void> {
+  const saved = { clockTick, requestCounter, nextRepoId, nextLabelId, nextIssueId, nextCommentId, nextPullId };
+  try {
+    const stamp = stampNow();
+    const scratch: Repo = {
+      id: 0,
+      owner: 'warmup',
+      name: 'warmup-scratch',
+      description: null,
+      isPrivate: false,
+      defaultBranch: 'main',
+      objects: new Map(),
+      refs: new Map(),
+      labels: new Map(),
+      issues: new Map(),
+      comments: new Map(),
+      pulls: new Map(),
+      nextNumber: 1,
+      createdSec: stamp.sec,
+      updatedSec: stamp.sec,
+    };
+    const blob = storeObject(scratch, 'blob', Buffer.from('# warmup\n', 'utf8'));
+    const tree = buildTreeFromFiles(scratch, new Map([['README.md', { oid: blob, mode: '100644' }]]));
+    let tip = makeCommit(scratch, { tree, parent: null, message: 'warmup' });
+    scratch.refs.set(headRefOf(scratch), tip);
+    for (let round = 0; round < 30; round += 1) {
+      handleInfoRefs(scratch, 'git-upload-pack', null);
+      handleInfoRefs(scratch, 'git-receive-pack', null);
+      handleInfoRefs(scratch, 'git-upload-pack', 'version=2');
+      const lsRefsBody = Buffer.concat([pktLine('command=ls-refs'), pktLine('agent=warmup'), PKT_DELIM, pktLine('ref-prefix refs/'), PKT_FLUSH]);
+      handleUploadPack(scratch, lsRefsBody);
+      const fetchBody = Buffer.concat([
+        pktLine('command=fetch'),
+        pktLine('agent=warmup'),
+        PKT_DELIM,
+        pktLine(`want ${tip}`),
+        pktLine('deepen 1'),
+        pktLine('done'),
+        PKT_FLUSH,
+      ]);
+      handleUploadPack(scratch, fetchBody);
+      const created = restCreateIssue(scratch, { title: `warmup ${round}`, body: 'warmup' });
+      const number = (created.body as { number: number }).number;
+      restGetIssue(scratch, number);
+      restCreateComment(scratch, number, { body: 'warmup' });
+      restGetIssue(scratch, number);
+      restPatchIssue(scratch, number, { state: 'closed' });
+      restGetIssue(scratch, number);
+      const nextBlob = storeObject(scratch, 'blob', Buffer.from(`# warmup ${round}\n`, 'utf8'));
+      const nextTree = buildTreeFromFiles(scratch, new Map([['README.md', { oid: nextBlob, mode: '100644' }]]));
+      const nextCommit = makeCommit(scratch, { tree: nextTree, parent: tip, message: `warmup ${round}` });
+      const pack = writePack([
+        scratch.objects.get(nextCommit) as GitObject,
+        scratch.objects.get(nextTree) as GitObject,
+        scratch.objects.get(nextBlob) as GitObject,
+      ]);
+      const command = pktLine(`${tip} ${nextCommit} refs/heads/main\0 report-status\n`);
+      await handleReceivePack(scratch, Buffer.concat([command, PKT_FLUSH, pack]));
+      tip = nextCommit;
+    }
+  } catch {
+    // Warmup is best-effort: a failure here must never stop the forge from serving.
+  } finally {
+    clockTick = saved.clockTick;
+    requestCounter = saved.requestCounter;
+    nextRepoId = saved.nextRepoId;
+    nextLabelId = saved.nextLabelId;
+    nextIssueId = saved.nextIssueId;
+    nextCommentId = saved.nextCommentId;
+    nextPullId = saved.nextPullId;
+  }
 }
 
 // --------------------------------------------------------------------------- lifecycle
@@ -3684,6 +3821,7 @@ function harnessCall(method: 'GET' | 'POST', target: string, payload?: string): 
 }
 
 async function runWithHarness(envUrl: string): Promise<void> {
+  await selfWarm();
   await new Promise<void>((resolve) => {
     server.listen(0, () => resolve());
   });
@@ -3727,7 +3865,9 @@ if (envUrl !== undefined && envUrl !== '') {
   runWithHarness(envUrl).catch(() => process.exit(1));
 } else {
   const port = Number(process.env.PORT ?? '8077');
-  server.listen(port, () => {
-    process.stderr.write(`forge listening on ${port}\n`);
+  void selfWarm().then(() => {
+    server.listen(port, () => {
+      process.stderr.write(`forge listening on ${port}\n`);
+    });
   });
 }
